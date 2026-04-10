@@ -55,23 +55,31 @@ pub fn disassemble(raw: &[u8]) -> Vec<RawInsn> {
     insns
 }
 
-/// Parse input that may be raw bytes or an ASCII hex string (with or without 0x prefix).
+/// Parse raw bytes that may be a hex string (with or without `0x` prefix) or raw binary.
 pub fn parse_input(data: &[u8]) -> Vec<u8> {
-    // If printable ASCII (hex string), decode it
-    if data.iter().all(|&b| b.is_ascii_hexdigit() || b == b'\n' || b == b'\r' || b == b' ') {
-        let hex: String = data
-            .iter()
-            .filter(|&&b| b.is_ascii_hexdigit())
-            .map(|&b| b as char)
-            .collect();
-        let hex = hex.trim_start_matches("0x");
-        if hex.len() % 2 == 0 {
-            if let Ok(decoded) = hex_decode(hex) {
+    // Accept: hex digits, optional 0x/0X prefix, and whitespace
+    let is_hex_text = data.iter().all(|&b| {
+        b.is_ascii_hexdigit() || matches!(b, b'x' | b'X' | b'\n' | b'\r' | b' ' | b'\t')
+    });
+    if is_hex_text {
+        if let Ok(s) = std::str::from_utf8(data) {
+            if let Some(decoded) = decode_hex_str(s.trim()) {
                 return decoded;
             }
         }
     }
     data.to_vec()
+}
+
+/// Decode a hex string that may carry an optional `0x`/`0X` prefix.
+/// Returns `None` if the string is empty, odd-length, or contains invalid chars.
+pub fn decode_hex_str(s: &str) -> Option<Vec<u8>> {
+    let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    let compact: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    if compact.is_empty() || compact.len() % 2 != 0 {
+        return None;
+    }
+    hex_decode(&compact).ok()
 }
 
 fn hex_decode(s: &str) -> Result<Vec<u8>, ()> {

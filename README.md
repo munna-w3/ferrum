@@ -1,10 +1,10 @@
 # Ferrum
 
-**EVM bytecode security analyzer — written in Rust.**
+**EVM smart contract security analyzer — written in Rust.**
 
-Ferrum disassembles Ethereum smart contract bytecode, lifts it to an SSA-like intermediate representation, runs forward taint analysis, and reports security vulnerabilities with severity levels, precise locations, and remediation guidance.
+Ferrum accepts a Solidity source file (`.sol`) or pre-compiled bytecode, disassembles it, lifts it to an SSA-like intermediate representation, runs forward taint analysis, and reports security vulnerabilities with severity levels, precise locations, and remediation guidance.
 
-Built as a faster, more capable successor to Python-based tools (Mythril, Rattle) with zero dependencies and sub-millisecond analysis.
+Built as a faster, more capable successor to Python-based tools (Mythril, Rattle) with minimal dependencies and sub-millisecond analysis on bytecode.
 
 ---
 
@@ -13,29 +13,37 @@ Built as a faster, more capable successor to Python-based tools (Mythril, Rattle
 ### Analysis pipeline
 
 ```
-bytecode (hex / binary)
-        │
-        ▼
-  Disassembler          — full EVM opcode set incl. PUSH0, TLOAD/TSTORE, MCOPY (Cancun)
-        │
-        ▼
-  CFG Builder           — basic block identification, static jump target resolution
-        │
-        ▼
-  IR Lifter             — stack simulation → SSA-like value graph
-                          ABI function detection from 4-byte selector dispatch
-        │
-        ▼
-  Taint Analysis        — forward BFS from user-controlled sources
-                          (calldata, msg.sender, msg.value, tx.origin,
-                           block.timestamp, blockhash, block.number,
-                           block.coinbase, prevrandao)
-        │
-        ▼
-  Vulnerability Detectors  (10 detectors, see table below)
-        │
-        ▼
-  Output  (colored text / JSON / SARIF 2.1.0)
+Solidity source (.sol)           pre-compiled bytecode (hex / binary)
+        │                                        │
+        ▼                                        │
+  solc compiler                                  │
+  (bin-runtime per contract)                     │
+        │                                        │
+        └───────────────────┬────────────────────┘
+                            ▼
+                      Disassembler       — full EVM opcode set incl. PUSH0,
+                                           TLOAD/TSTORE, MCOPY (Cancun)
+                            │
+                            ▼
+                      CFG Builder        — basic block identification,
+                                           static jump target resolution
+                            │
+                            ▼
+                      IR Lifter          — stack simulation → SSA-like value graph
+                                           ABI function detection from 4-byte
+                                           selector dispatch
+                            │
+                            ▼
+                      Taint Analysis     — forward BFS from user-controlled sources
+                                           (calldata, msg.sender, msg.value,
+                                           tx.origin, block.timestamp, blockhash,
+                                           block.number, block.coinbase, prevrandao)
+                            │
+                            ▼
+                      Vulnerability Detectors  (12 detectors, see table below)
+                            │
+                            ▼
+                      Output  (colored text / JSON / SARIF 2.1.0)
 ```
 
 ### Vulnerability detectors
@@ -59,8 +67,10 @@ bytecode (hex / binary)
 
 | Feature | Rattle | Mythril | Ferrum |
 |---------|--------|---------|--------|
+| Input | bytecode | bytecode | **.sol source or bytecode** |
 | Vulnerability detectors | None | ~10 (symbolic) | 12 (taint + CFG) |
 | Detection approach | — | Symbolic execution | Taint + static CFG |
+| Multi-contract files | No | No | Yes |
 | Modern opcodes (PUSH0, TLOAD, MCOPY) | No | Partial | Yes |
 | JSON output | No | Yes | Yes |
 | SARIF 2.1.0 (GitHub Code Scanning) | No | No | Yes |
@@ -87,6 +97,18 @@ Or install to `~/.cargo/bin`:
 cargo install --path .
 ```
 
+**For Solidity source file analysis:** `solc` must be in your `PATH`.
+
+```bash
+# macOS
+brew install solidity
+
+# Linux (via snap)
+snap install solc --classic
+
+# or download from https://docs.soliditylang.org/en/latest/installing-solidity.html
+```
+
 ---
 
 ## Usage
@@ -95,10 +117,11 @@ cargo install --path .
 ferrum [OPTIONS]
 
 Options:
-  -i, --input <FILE>      Input EVM bytecode (hex or raw binary); stdin if omitted
+  -i, --input <FILE>      .sol source file or EVM bytecode (hex or raw binary);
+                          stdin if omitted (bytecode only)
   -j, --json              Emit results as JSON
       --sarif             Emit results as SARIF 2.1.0 (GitHub Code Scanning)
-      --disasm            Print disassembled opcodes and exit
+      --disasm            Print disassembled opcodes and exit (bytecode mode only)
       --list-detectors    Print all detectors with severity/SWC and exit
   -o, --output <FILE>     Write output to FILE instead of stdout
       --color             Force ANSI color even when stdout is not a TTY
@@ -107,32 +130,51 @@ Options:
   -V, --version           Print version
 ```
 
-### Analyze a contract
+### Analyze a Solidity source file
 
 ```bash
-ferrum -i contract.bin
+ferrum -i contract.sol
 ```
 
-### Read from stdin (hex string)
+Ferrum detects the `.sol` extension, compiles the file with `solc`, and runs the full analysis pipeline on the runtime bytecode of every deployable contract. Interfaces and abstract contracts are skipped automatically.
+
+### Analyze a file with multiple contracts
 
 ```bash
-echo "6080604052..." | ferrum
-# or from a file
-cat contract.bin | ferrum
+ferrum -i contracts/Token.sol
+```
+
+Each contract gets its own labeled section in the output. In JSON mode the result is a single object (one contract) or an array (multiple contracts), each with a `"contract"` field.
+
+### Analyze pre-compiled bytecode
+
+```bash
+ferrum -i contract.bin          # raw binary or hex file
+echo "6080604052..." | ferrum   # hex via stdin
 ```
 
 ### JSON output for scripting
 
 ```bash
-ferrum -i contract.bin --json
-ferrum -i contract.bin --json -o report.json
+ferrum -i contract.sol --json
+ferrum -i contract.sol --json -o report.json
 ```
 
 ### SARIF for GitHub Code Scanning
 
 ```bash
-ferrum -i contract.bin --sarif > results.sarif
-# upload via upload-sarif action in CI
+ferrum -i contract.sol --sarif > results.sarif
+```
+
+Upload with the `upload-sarif` action:
+
+```yaml
+- name: Security scan
+  run: ferrum -i src/MyContract.sol --sarif -o ferrum.sarif
+- name: Upload SARIF
+  uses: github/codeql-action/upload-sarif@v3
+  with:
+    sarif_file: ferrum.sarif
 ```
 
 ### List all detectors
@@ -141,7 +183,7 @@ ferrum -i contract.bin --sarif > results.sarif
 ferrum --list-detectors
 ```
 
-### Disassembly only
+### Disassembly only (bytecode mode)
 
 ```bash
 ferrum -i contract.bin --disasm
@@ -154,48 +196,38 @@ ferrum -i contract.bin --disasm
 | `0` | No CRITICAL or HIGH findings |
 | `1` | At least one CRITICAL or HIGH finding (or I/O error) |
 
-CI pipeline example:
-
-```yaml
-- name: Security scan
-  run: ferrum -i build/MyContract.bin --sarif -o ferrum.sarif
-- name: Upload SARIF
-  uses: github/codeql-action/upload-sarif@v3
-  with:
-    sarif_file: ferrum.sarif
-```
-
 ---
 
 ## Example output
 
-Running on the classic EtherStore reentrancy-vulnerable contract:
+Running `ferrum -i contracts/sam.sol` on a reentrancy-vulnerable contract:
 
 ```
+=== Sanam ===
+
 ════════════════════════════════════════════════════════════
   FERRUM  ·  EVM Security Analyzer  ·  Rust Edition
 ════════════════════════════════════════════════════════════
 
-  Bytecode  :  1358 bytes  ·  514 opcodes  ·  98 blocks
+  Bytecode  :  1190 bytes  ·  450 opcodes  ·  85 blocks
 
   Identified Functions
   ────────────────────────────────────────
-  0x0037  fn_0x27e235e3()    [0x27e235e3]
-  0x0073  withdraw(uint256)  [0x2e1a7d4d]
-  0x009b  deposit()          [0xd0e30db0]
+  0x0038  fn_0x89fdb7d8() [0x89fdb7d8]
+  0x0054  fn_0xe3d670d7() [0xe3d670d7]
 
-  Storage slots :  0x22b, 0x281
+  Storage slots :  0x1f6
   Sends ether   :  yes
 
   Security Findings
   ────────────────────────────────────────
 
   [1]  HIGH      ·  Potential Reentrancy
-       deposit() @ 0x169
-       CALL at 0x169 can reach SSTORE at 0x231 before state is updated.
-       A re-entrant attacker can invoke this contract again during the
-       external call and observe stale storage values. Recommendation:
-       apply Checks-Effects-Interactions — update all state before making
+       fn_0xe3d670d7() @ 0x134
+       CALL at 0x134 can reach SSTORE at 0x1fc before state is updated. A
+       re-entrant attacker can invoke this contract again during the external
+       call and observe stale storage values. Recommendation: apply
+       Checks-Effects-Interactions — update all state before making
        external calls, or use a nonReentrant mutex (ReentrancyGuard).
 
 ════════════════════════════════════════════════════════════
@@ -207,22 +239,24 @@ Running on the classic EtherStore reentrancy-vulnerable contract:
 
 ## Input formats
 
-Ferrum auto-detects input format:
+| Format | Example | Notes |
+|--------|---------|-------|
+| **Solidity source** | `ferrum -i MyContract.sol` | Compiled on-the-fly via `solc`; imports resolved relative to the file |
+| **Hex (bare)** | `6080604052...` | Via file or stdin |
+| **Hex (0x-prefixed)** | `0x6080604052...` | Via file or stdin |
+| **Raw binary** | `.bin` file | Via file or stdin |
 
-- **ASCII hex** — `6080604052...` with or without `0x` prefix
-- **Raw binary** — the raw bytecode bytes
-- **Whitespace / newlines** ignored in hex mode
-
-Solidity `--bin-runtime`:
-
-```bash
-solc --bin-runtime MyContract.sol 2>/dev/null | tail -n1 | ferrum
-```
-
-Foundry / Hardhat:
+For contracts that have already been compiled, you can also pipe bytecode directly:
 
 ```bash
+# Foundry
 jq -r '.deployedBytecode' out/MyContract.sol/MyContract.json | ferrum
+
+# Hardhat
+jq -r '.deployedBytecode' artifacts/contracts/MyContract.sol/MyContract.json | ferrum
+
+# solc
+solc --bin-runtime MyContract.sol 2>/dev/null | tail -n1 | ferrum
 ```
 
 ---
@@ -232,14 +266,15 @@ jq -r '.deployedBytecode' out/MyContract.sol/MyContract.json | ferrum
 ```
 src/
 ├── opcodes.rs     Full EVM opcode set (Cancun: PUSH0, TLOAD/TSTORE, MCOPY)
-├── disasm.rs      Bytecode → RawInsn list; CBOR metadata stripping
+├── disasm.rs      Bytecode → RawInsn list; hex/binary input parsing; CBOR metadata stripping
+├── compile.rs     Solidity source → bytecode via solc (--combined-json bin-runtime)
 ├── cfg.rs         Basic block identification; static JUMP resolution; CFG
 ├── lifter.rs      Stack simulation → SSA-like IR; ABI function detection
 ├── taint.rs       Forward BFS taint propagation (9 taint sources)
 ├── detectors.rs   12 vulnerability detectors on IR + taint map
 ├── output.rs      ANSI text / JSON / SARIF 2.1.0 formatters
 ├── lib.rs         Module declarations
-└── main.rs        CLI (clap)
+└── main.rs        CLI (clap); .sol vs bytecode routing
 ```
 
 ---
@@ -249,6 +284,8 @@ src/
 **Computed jump targets** — jump destinations computed at runtime leave CFG edges missing. This is inherent to static analysis; symbolic execution (Mythril) handles these at ~1000× the cost.
 
 **Solidity 0.8 subroutine pattern** — the compiler emits an internal calling convention (PUSH return_addr; PUSH helper; JUMP) for ABI decoding and SafeMath. The static CFG cannot resolve the dynamic return edge, so some blocks appear orphaned. Ferrum uses a bytecode-order heuristic to bridge this for reentrancy detection, but function attribution in findings may show the nearest-preceding function name rather than the true enclosing function.
+
+**External imports** — when a `.sol` file imports from npm packages (e.g. `@openzeppelin/contracts`), those packages must be resolvable by `solc` from the file's directory. For Foundry/Hardhat projects, run `ferrum` from the project root or ensure `node_modules` is present.
 
 **Memory taint** — taint is tracked over the SSA value graph (registers), not memory. Block variables encoded into memory via `abi.encodePacked` before being hashed are not detected by the WEAK-RANDOMNESS detector. Simple patterns (`keccak256(block.timestamp)` without encoding) are detected.
 
