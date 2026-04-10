@@ -115,6 +115,13 @@ pub fn format_text(prog: &IrProgram, findings: &[Finding], color: bool) -> Strin
             };
             out += &format!("       {}\n", p.dim(&loc));
 
+            // Source snippet (only present for .sol input)
+            if let (Some(ln), Some(snippet)) = (f.source_line_number, &f.source_snippet) {
+                out += &format!("       {}  {}\n",
+                    p.dim(&format!("Line {}:", ln)),
+                    p.cyan(snippet));
+            }
+
             // Description (word-wrap at ~72 chars)
             for line in wrap(&f.description, 70) {
                 out += &format!("       {}\n", line);
@@ -182,12 +189,14 @@ pub fn format_json(prog: &IrProgram, findings: &[Finding]) -> String {
 
     let findings_json: Vec<Value> = findings.iter().map(|f| {
         json!({
-            "severity":      f.severity.label(),
-            "id":            f.id,
-            "title":         f.title,
-            "description":   f.description,
-            "pc":            f.pc.map(|p| format!("{:#x}", p)),
-            "function":      f.function_name,
+            "severity":           f.severity.label(),
+            "id":                 f.id,
+            "title":              f.title,
+            "description":        f.description,
+            "pc":                 f.pc.map(|p| format!("{:#x}", p)),
+            "function":           f.function_name,
+            "source_line":        f.source_line_number,
+            "source_snippet":     f.source_snippet,
         })
     }).collect();
 

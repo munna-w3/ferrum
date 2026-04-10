@@ -114,9 +114,9 @@ fn run_sol(args: &Args, use_color: bool) {
     let mut any_bad = false;
 
     let text = if args.json {
-        // Produce a JSON array; each element gets a leading "contract" key.
         let items: Vec<Value> = contracts.iter().map(|c| {
-            let (prog, findings) = pipeline(&c.bytecode);
+            let (prog, mut findings) = pipeline(&c.bytecode);
+            enrich_sol_findings(&mut findings, &prog, c);
             any_bad = any_bad || is_bad(&findings);
             let raw = output::format_json(&prog, &findings);
             let mut obj: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
@@ -126,7 +126,6 @@ fn run_sol(args: &Args, use_color: bool) {
             obj
         }).collect();
 
-        // Single contract → bare object; multiple → array.
         let root = if items.len() == 1 {
             items.into_iter().next().unwrap()
         } else {
@@ -135,10 +134,10 @@ fn run_sol(args: &Args, use_color: bool) {
         serde_json::to_string_pretty(&root).unwrap_or_default()
 
     } else if args.sarif {
-        // Produce a SARIF document; multiple contracts → multiple runs.
         let mut runs: Vec<Value> = Vec::new();
         for c in &contracts {
-            let (prog, findings) = pipeline(&c.bytecode);
+            let (prog, mut findings) = pipeline(&c.bytecode);
+            enrich_sol_findings(&mut findings, &prog, c);
             any_bad = any_bad || is_bad(&findings);
             let raw = output::format_sarif(&prog, &findings);
             if let Ok(mut sarif) = serde_json::from_str::<Value>(&raw) {
@@ -158,11 +157,11 @@ fn run_sol(args: &Args, use_color: bool) {
         serde_json::to_string_pretty(&doc).unwrap_or_default()
 
     } else {
-        // Text: one section per contract, separated by a header.
         let mut out = String::new();
         for (i, c) in contracts.iter().enumerate() {
             if i > 0 { out.push('\n'); }
-            let (prog, findings) = pipeline(&c.bytecode);
+            let (prog, mut findings) = pipeline(&c.bytecode);
+            enrich_sol_findings(&mut findings, &prog, c);
             any_bad = any_bad || is_bad(&findings);
             out.push_str(&contract_header(&c.name, use_color));
             out.push_str(&output::format_text(&prog, &findings, use_color));
@@ -172,6 +171,65 @@ fn run_sol(args: &Args, use_color: bool) {
 
     write_output(&text, args);
     process::exit(if any_bad { 1 } else { 0 });
+}
+
+/// Post-process findings produced from a `.sol` compilation:
+/// 1. Fill `source_line_number` and `source_snippet` via the solc source map.
+/// 2. Set `function_name` to the actual Solidity name by scanning the source
+///    backward from the buggy line to find the enclosing `function` declaration.
+///    Falls back to the selector-hash lookup from `c.fn_names`, then to
+///    stripping the `(…)` off the ABI signature.
+fn enrich_sol_findings(
+    findings: &mut Vec<Finding>,
+    prog:     &IrProgram,
+    c:        &compile::CompiledContract,
+) {
+    // Selector → bare name from solc's hashes field (e.g. 0xe3d670d7 → "give_some").
+    // Used only when source-scanning can't find an enclosing function.
+    let fn_name_map: std::collections::HashMap<&str, String> = prog.functions.iter()
+        .filter_map(|f| {
+            let actual = if let Some(sel) = f.selector {
+                c.fn_names.get(&sel)
+                    .cloned()
+                    .unwrap_or_else(|| f.name.split('(').next().unwrap_or(&f.name).to_string())
+            } else {
+                f.name.split('(').next().unwrap_or(&f.name).to_string()
+            };
+            Some((f.name.as_str(), actual))
+        })
+        .collect();
+
+    let raw_insns = disasm::disassemble(&c.bytecode);
+
+    for f in findings.iter_mut() {
+        // ── Step 1: source line ───────────────────────────────────────────
+        if let Some(pc) = f.pc {
+            if let Some((ln, snippet)) =
+                compile::pc_to_source_line(&c.src_map, &raw_insns, &c.source, pc)
+            {
+                f.source_line_number = Some(ln);
+                f.source_snippet     = Some(snippet);
+            }
+        }
+
+        // ── Step 2: function name ─────────────────────────────────────────
+        // Primary: scan the source backward from the buggy line.
+        let from_source = f.source_line_number
+            .and_then(|ln| compile::enclosing_function_name(&c.source, ln));
+
+        f.function_name = if let Some(name) = from_source {
+            Some(name)
+        } else if let Some(ref existing) = f.function_name.clone() {
+            // Secondary: translate existing selector-based name via fn_names.
+            Some(
+                fn_name_map.get(existing.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| existing.split('(').next().unwrap_or(existing).to_string()),
+            )
+        } else {
+            None
+        };
+    }
 }
 
 // ── Pre-compiled bytecode path ────────────────────────────────────────────────

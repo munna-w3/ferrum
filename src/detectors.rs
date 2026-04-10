@@ -40,14 +40,18 @@ impl Severity {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Finding {
-    pub severity:      Severity,
-    pub id:            &'static str,
-    pub title:         &'static str,
-    pub description:   String,
+    pub severity:           Severity,
+    pub id:                 &'static str,
+    pub title:              &'static str,
+    pub description:        String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub pc:            Option<usize>,
+    pub pc:                 Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub function_name: Option<String>,
+    pub function_name:      Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_line_number: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_snippet:     Option<String>,
 }
 
 /// Metadata for --list-detectors output.
@@ -120,6 +124,12 @@ pub fn list_all_detectors() -> Vec<DetectorInfo> {
             id: "WEAK-RANDOMNESS", title: "Weak Pseudo-Randomness",
             severity: Severity::Medium, swc: Some("SWC-120"),
             description: "Block variables (timestamp, blockhash, number, coinbase) used as randomness source.",
+        },
+        DetectorInfo {
+            id: "STORAGE-COLLISION", title: "Proxy Storage Collision",
+            severity: Severity::High, swc: None,
+            description: "DELEGATECALL present and SSTORE to a low sequential slot — \
+                           the implementation shares this contract's storage and can corrupt proxy state.",
         },
     ]
 }
@@ -293,6 +303,8 @@ fn detect_reentrancy(prog: &IrProgram) -> Vec<Finding> {
             ),
             pc:            Some(call_pc),
             function_name: prog.function_at(call_pc),
+                source_line_number: None,
+                source_snippet:     None,
         });
     }
     findings
@@ -324,6 +336,8 @@ fn detect_unchecked_call(prog: &IrProgram) -> Vec<Finding> {
                 ),
                 pc:            Some(ir.pc),
                 function_name: prog.function_at(ir.pc),
+                source_line_number: None,
+                source_snippet:     None,
             });
         }
     }
@@ -356,6 +370,8 @@ fn detect_tx_origin(prog: &IrProgram) -> Vec<Finding> {
                 ),
                 pc:            Some(ir.pc),
                 function_name: prog.function_at(ir.pc),
+                source_line_number: None,
+                source_snippet:     None,
             });
         }
     }
@@ -387,6 +403,8 @@ fn detect_selfdestruct(prog: &IrProgram) -> Vec<Finding> {
                 ),
                 pc:            Some(ir.pc),
                 function_name: prog.function_at(ir.pc),
+                source_line_number: None,
+                source_snippet:     None,
             });
         } else {
             findings.push(Finding {
@@ -402,6 +420,8 @@ fn detect_selfdestruct(prog: &IrProgram) -> Vec<Finding> {
                 ),
                 pc:            Some(ir.pc),
                 function_name: prog.function_at(ir.pc),
+                source_line_number: None,
+                source_snippet:     None,
             });
         }
     }
@@ -435,6 +455,8 @@ fn detect_timestamp(prog: &IrProgram) -> Vec<Finding> {
                 ),
                 pc:            Some(ir.pc),
                 function_name: prog.function_at(ir.pc),
+                source_line_number: None,
+                source_snippet:     None,
             });
         }
     }
@@ -468,6 +490,8 @@ fn detect_delegatecall(prog: &IrProgram, taint: &TaintMap) -> Vec<Finding> {
                     ),
                     pc:            Some(ir.pc),
                     function_name: prog.function_at(ir.pc),
+                source_line_number: None,
+                source_snippet:     None,
                 });
             }
         }
@@ -522,6 +546,8 @@ fn detect_integer_overflow(prog: &IrProgram, taint: &TaintMap) -> Vec<Finding> {
                 ),
                 pc:            Some(ir.pc),
                 function_name: prog.function_at(ir.pc),
+                source_line_number: None,
+                source_snippet:     None,
             });
         }
     }
@@ -650,6 +676,8 @@ fn detect_arbitrary_jump(prog: &IrProgram, taint: &TaintMap) -> Vec<Finding> {
                 ),
                 pc:            Some(ir.pc),
                 function_name: prog.function_at(ir.pc),
+                source_line_number: None,
+                source_snippet:     None,
             });
         }
     }
@@ -691,6 +719,8 @@ fn detect_controlled_call_target(prog: &IrProgram, taint: &TaintMap) -> Vec<Find
                     ),
                     pc:            Some(ir.pc),
                     function_name: prog.function_at(ir.pc),
+                source_line_number: None,
+                source_snippet:     None,
                 });
             }
         }
@@ -739,6 +769,8 @@ fn detect_weak_randomness(prog: &IrProgram) -> Vec<Finding> {
                 ),
                 pc:            Some(ir.pc),
                 function_name: prog.function_at(ir.pc),
+                source_line_number: None,
+                source_snippet:     None,
             });
         }
 
@@ -758,9 +790,95 @@ fn detect_weak_randomness(prog: &IrProgram) -> Vec<Finding> {
                 ),
                 pc:            Some(ir.pc),
                 function_name: prog.function_at(ir.pc),
+                source_line_number: None,
+                source_snippet:     None,
             });
         }
     }
+    findings
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 11. Proxy storage collision
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Known EIP-1967 unstructured storage slots (32 bytes each, big-endian).
+/// These are safe to use in a proxy because they don't overlap with a
+/// Solidity contract's sequential slot layout.
+static EIP1967_SLOTS: &[[u8; 32]] = &[
+    // bytes32(uint256(keccak256("eip1967.proxy.implementation")) - 1)
+    [0x36,0x08,0x94,0xa1,0x3b,0xa1,0xa3,0x21,0x06,0x67,0xc8,0x28,0x49,0x2d,0xb9,0x8d,
+     0xca,0x3e,0x20,0x76,0xcc,0x37,0x35,0xa9,0x20,0xa3,0xca,0x50,0x5d,0x38,0x2b,0xbc],
+    // bytes32(uint256(keccak256("eip1967.proxy.admin")) - 1)
+    [0xb5,0x31,0x27,0x68,0x4a,0x56,0x8b,0x31,0x73,0xae,0x13,0xb9,0xf8,0xa6,0x01,0x6e,
+     0x24,0x3e,0x63,0xb6,0xe8,0xee,0x11,0x78,0xd6,0xa7,0x17,0x85,0x0b,0x5d,0x61,0x03],
+    // bytes32(uint256(keccak256("eip1967.proxy.rollback")) - 1)
+    [0x49,0x10,0xfd,0xfa,0x16,0xfe,0xd3,0x26,0x0e,0xd0,0xe7,0x14,0x7f,0x7c,0xc6,0xda,
+     0x11,0xa6,0x02,0x08,0xb5,0xb9,0x40,0x6d,0x12,0xa6,0x35,0x61,0x4f,0xfd,0x91,0x43],
+    // bytes32(uint256(keccak256("eip1967.proxy.beacon")) - 1)
+    [0xa3,0xf0,0xad,0x74,0xe5,0x42,0x3a,0xeb,0xfd,0x80,0xd3,0xef,0x43,0x46,0x57,0x83,
+     0x35,0xa9,0xa7,0x2a,0xea,0xee,0x59,0xff,0x6c,0xb3,0x58,0x2b,0x35,0x13,0x3d,0x50],
+];
+
+/// Return true if `slot` is one of the known EIP-1967 unstructured storage slots.
+fn is_eip1967(slot: &[u8; 32]) -> bool {
+    EIP1967_SLOTS.iter().any(|s| s == slot)
+}
+
+/// Return true if the slot is "low" — i.e. the top 28 bytes are zero,
+/// meaning the slot value fits in a u32.  These are sequential/direct
+/// Solidity slots (slot 0, 1, 2, …) that collide with implementation layouts.
+fn is_low_slot(slot: &[u8; 32]) -> bool {
+    slot[..28].iter().all(|&b| b == 0)
+}
+
+fn detect_storage_collision(prog: &IrProgram) -> Vec<Finding> {
+    let mut findings = Vec::new();
+
+    // Only a proxy pattern is affected: contract must use DELEGATECALL.
+    let has_delegatecall = prog.all_insns.iter()
+        .any(|ir| ir.op == Opcode::DelegateCall);
+    if !has_delegatecall { return findings; }
+
+    let mut reported: HashSet<usize> = HashSet::new();
+
+    for ir in &prog.all_insns {
+        if ir.op != Opcode::SStore { continue; }
+
+        // Slot is the first argument to SSTORE.
+        let slot_id = match ir.args.first() { Some(&id) => id, None => continue };
+        let word    = match prog.concrete(slot_id) { Some(w) => w, None => continue };
+
+        // Skip EIP-1967 compliant slots — those are intentionally collision-resistant.
+        if is_eip1967(&word.0) { continue; }
+
+        // Flag sequential/low slots only.
+        if !is_low_slot(&word.0) { continue; }
+
+        if !reported.insert(ir.pc) { continue; }
+
+        findings.push(Finding {
+            severity:      Severity::High,
+            id:            "STORAGE-COLLISION",
+            title:         "Proxy Storage Collision",
+            description:   format!(
+                "SSTORE to slot {} at {:#x} in a contract that also uses DELEGATECALL. \
+                 DELEGATECALL executes the implementation's code in this contract's storage \
+                 context, so any write the implementation makes to slot {} will overwrite \
+                 this contract's own state variable at that slot (e.g. the implementation \
+                 address, owner, or balance). \
+                 Recommendation: store proxy-specific variables at EIP-1967 unstructured \
+                 storage slots (keccak256-derived, e.g. 0x3608…) so they cannot be reached \
+                 by the implementation's sequential layout.",
+                word, ir.pc, word
+            ),
+            pc:            Some(ir.pc),
+            function_name: prog.function_at(ir.pc),
+            source_line_number: None,
+            source_snippet:     None,
+        });
+    }
+
     findings
 }
 
@@ -780,6 +898,7 @@ pub fn run_all(prog: &IrProgram, taint: &TaintMap) -> Vec<Finding> {
     all.extend(detect_arbitrary_jump(prog, taint));
     all.extend(detect_controlled_call_target(prog, taint));
     all.extend(detect_weak_randomness(prog));
+    all.extend(detect_storage_collision(prog));
     // Sort: Critical first, then by PC within each severity
     all.sort_by(|a, b| a.severity.cmp(&b.severity).then(a.pc.cmp(&b.pc)));
     all
